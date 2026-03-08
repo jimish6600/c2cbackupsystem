@@ -134,7 +134,7 @@ async function commitAllFiles(branchName, files, commitMessage) {
 // Main API
 app.post('/store-template', async (req, res) => {
     try {
-        const { company_id, ...templatePayload } = req.body;
+        const { company_id, commit, ...templatePayload } = req.body;
 
         if (!company_id) {
             return res.status(400).json({ success: false, message: 'company_id is required' });
@@ -142,7 +142,8 @@ app.post('/store-template', async (req, res) => {
 
         const branchName = getBranchName(company_id);
         const timestamp = getTimestamp();
-        const commitMessage = `[${company_id}] Update templates | ${timestamp}`;
+        const label = commit ? commit : 'Update templates';
+        const commitMessage = `${label} | ${timestamp}`;
 
         await initializeRepoIfEmpty();
 
@@ -307,7 +308,8 @@ app.get('/get-commits', async (req, res) => {
         });
 
         const commitList = commits.map(c => ({
-            commit_sha: c.sha,
+            commit_sha: c.sha.substring(0, 7),
+            commit_sha_full: c.sha,
             message: c.commit.message,
             committed_at: c.commit.author.date,
         }));
