@@ -19,7 +19,7 @@ function getTimestamp() {
 }
 
 function getBranchName(company_id) {
-    return `company-${company_id}`;
+    return company_id;
 }
 
 // Determine file extension based on key name
@@ -31,24 +31,42 @@ function getFileExtension(key) {
 
 // Flatten payload into file list
 // Handles: top-level strings, top-level objects (nested templates)
-function buildFileList(company_id, payload) {
+// Keys starting with published_/unpublished_ are grouped into published/ or unpublished/ subfolder
+function buildFileList(payload) {
     const files = [];
     const SKIP_KEYS = ['company_id'];
 
     for (const [key, value] of Object.entries(payload)) {
         if (SKIP_KEYS.includes(key)) continue;
 
+        // Detect published/unpublished prefix and strip it from the file name
+        let folder = null;
+        let strippedKey = key;
+        if (key.startsWith('published_')) {
+            folder = 'published';
+            strippedKey = key.slice('published_'.length);
+        } else if (key.startsWith('unpublished_')) {
+            folder = 'unpublished';
+            strippedKey = key.slice('unpublished_'.length);
+        }
+
         if (typeof value === 'string') {
-            // Top-level string: e.g. published_c2c_css → company_id/published_c2c.css
+            // e.g. published_c2c_css → published/c2c_css.css
             const ext = getFileExtension(key);
-            files.push({ path: `${company_id}/${key}${ext}`, content: value });
+            const filePath = folder
+                ? `${folder}/${strippedKey}${ext}`
+                : `${key}${ext}`;
+            files.push({ path: filePath, content: value });
 
         } else if (value && typeof value === 'object' && !Array.isArray(value)) {
-            // Nested object: e.g. unpublished_c2c_template.product_listing → company_id/unpublished_c2c_template/product_listing.html
+            // e.g. published_c2c_template.product_listing → published/c2c_template/product_listing.html
             for (const [subKey, subValue] of Object.entries(value)) {
                 if (typeof subValue === 'string') {
                     const ext = getFileExtension(subKey);
-                    files.push({ path: `${company_id}/${key}/${subKey}${ext}`, content: subValue });
+                    const filePath = folder
+                        ? `${folder}/${strippedKey}/${subKey}${ext}`
+                        : `${key}/${subKey}${ext}`;
+                    files.push({ path: filePath, content: subValue });
                 }
             }
         }
@@ -131,6 +149,46 @@ async function commitAllFiles(branchName, files, commitMessage) {
     return newCommit.sha;
 }
 
+// POST API - create a new branch from company base branch
+// new branch name: company-{company_id}-{name}
+app.post('/create-branch', async (req, res) => {
+    try {
+        const { company_id, name } = req.body;
+
+        if (!company_id) return res.status(400).json({ success: false, message: 'company_id is required' });
+        if (!name) return res.status(400).json({ success: false, message: 'name is required' });
+
+        const sourceBranch = getBranchName(company_id);
+        const newBranchName = `${sourceBranch}-${name}`;
+
+        // Source branch must exist
+        const sourceSha = await getBranchSha(sourceBranch);
+        if (!sourceSha) {
+            return res.status(404).json({ success: false, message: `Source branch not found: ${sourceBranch}` });
+        }
+
+        // New branch must not already exist
+        const existing = await getBranchSha(newBranchName);
+        if (existing) {
+            return res.status(409).json({ success: false, message: `Branch already exists: ${newBranchName}` });
+        }
+
+        await createBranch(newBranchName, sourceSha);
+        console.log(`Created branch: ${newBranchName} from ${sourceBranch}`);
+
+        return res.status(200).json({
+            success: true,
+            company_id,
+            source_branch: sourceBranch,
+            new_branch: newBranchName,
+        });
+
+    } catch (err) {
+        console.error('Error:', err.message || err);
+        return res.status(500).json({ success: false, message: err.message || 'Internal server error' });
+    }
+});
+
 // Main API
 app.post('/store-template', async (req, res) => {
     try {
@@ -160,7 +218,7 @@ app.post('/store-template', async (req, res) => {
         }
 
         // Build full file list from whatever keys are in the payload
-        const files = buildFileList(company_id, templatePayload);
+        const files = buildFileList(templatePayload);
 
         if (files.length === 0) {
             return res.status(400).json({ success: false, message: 'No valid template data found in payload' });
@@ -231,9 +289,9 @@ app.get('/get-template', async (req, res) => {
             owner: OWNER, repo: REPO, tree_sha: commitData.tree.sha, recursive: 'true',
         });
 
-        // Filter only files under company_id folder
+        // Filter only blob files (exclude README etc at root)
         const companyFiles = treeData.tree.filter(
-            item => item.type === 'blob' && item.path.startsWith(`${company_id}/`)
+            item => item.type === 'blob' && (item.path.startsWith('published/') || item.path.startsWith('unpublished/'))
         );
 
         if (companyFiles.length === 0) {
@@ -252,22 +310,25 @@ app.get('/get-template', async (req, res) => {
         );
 
         // Rebuild nested structure from flat file paths
+        // published/c2c_css.css           → published_c2c_css: "..."
+        // published/c2c_template/foo.html → published_c2c_template: { foo: "..." }
         const result = {};
         for (const { path, content } of fileContents) {
-            // Remove company_id/ prefix and strip extension
-            const relativePath = path.replace(`${company_id}/`, '');
-            const parts = relativePath.split('/');
+            const parts = path.split('/');
 
-            if (parts.length === 1) {
-                // Top-level file: published_c2c_css.css → published_c2c_css
-                const key = parts[0].replace(/\.(css|js|html)$/, '');
-                result[key] = content;
-            } else if (parts.length === 2) {
-                // Nested file: published_c2c_template/product_listing.html
-                const folder = parts[0];
+            if (parts.length === 2) {
+                // published/c2c_css.css → published_c2c_css
+                const prefix = parts[0];
                 const key = parts[1].replace(/\.(css|js|html)$/, '');
-                if (!result[folder]) result[folder] = {};
-                result[folder][key] = content;
+                result[`${prefix}_${key}`] = content;
+            } else if (parts.length === 3) {
+                // published/c2c_template/product_listing.html → published_c2c_template: { product_listing: ... }
+                const prefix = parts[0];
+                const subFolder = parts[1];
+                const key = parts[2].replace(/\.(css|js|html)$/, '');
+                const fullKey = `${prefix}_${subFolder}`;
+                if (!result[fullKey]) result[fullKey] = {};
+                result[fullKey][key] = content;
             }
         }
 
