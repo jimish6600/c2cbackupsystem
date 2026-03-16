@@ -218,7 +218,14 @@ app.post('/store-template', async (req, res) => {
         }
 
         // Build full file list from whatever keys are in the payload
-        const files = buildFileList(templatePayload);
+        let files = buildFileList(templatePayload);
+
+        // If company_id is numeric-only → commit both published & unpublished
+        // If company_id contains non-numeric characters → skip published files
+        const isNumericOnly = /^\d+$/.test(company_id);
+        if (!isNumericOnly) {
+            files = files.filter(f => !f.path.startsWith('published/'));
+        }
 
         if (files.length === 0) {
             return res.status(400).json({ success: false, message: 'No valid template data found in payload' });
