@@ -396,6 +396,74 @@ app.get('/get-commits', async (req, res) => {
     }
 });
 
+// GET API - autocomplete branch names, ordered by newest commit, optional title filter
+app.get('/branches', async (req, res) => {
+    try {
+        const { title } = req.query;
+        const search = title ? title.trim().toLowerCase() : '';
+
+        // Fetch up to 300 branches across 3 pages to build a solid search pool
+        let allBranches = [];
+        for (let page = 1; page <= 3; page++) {
+            const { data } = await octokit.repos.listBranches({
+                owner: OWNER, repo: REPO, per_page: 100, page,
+            });
+            allBranches = allBranches.concat(data);
+            if (data.length < 100) break;
+        }
+
+        // Filter by search term — case-insensitive substring match on branch name
+        const filtered = search
+            ? allBranches.filter(b => b.name.toLowerCase().includes(search))
+            : allBranches;
+
+        // Fetch commit dates in parallel for up to 60 candidates, then sort + trim to 30
+        // (60 gives enough buffer so after date-sorting we still return the true 30 newest)
+        const candidates = filtered.slice(0, 60);
+
+        const withDates = await Promise.all(
+            candidates.map(async (branch) => {
+                try {
+                    const { data: commit } = await octokit.git.getCommit({
+                        owner: OWNER, repo: REPO, commit_sha: branch.commit.sha,
+                    });
+                    return {
+                        name: branch.name,
+                        commit_sha: branch.commit.sha.substring(0, 7),
+                        commit_sha_full: branch.commit.sha,
+                        committed_at: commit.author.date,
+                    };
+                } catch {
+                    return {
+                        name: branch.name,
+                        commit_sha: branch.commit.sha.substring(0, 7),
+                        commit_sha_full: branch.commit.sha,
+                        committed_at: null,
+                    };
+                }
+            })
+        );
+
+        // Sort newest first — branches with no date fall to the bottom
+        withDates.sort((a, b) => {
+            if (!a.committed_at && !b.committed_at) return 0;
+            if (!a.committed_at) return 1;
+            if (!b.committed_at) return -1;
+            return new Date(b.committed_at) - new Date(a.committed_at);
+        });
+
+        return res.status(200).json({
+            success: true,
+            total: filtered.length,
+            branches: withDates.slice(0, 30),
+        });
+
+    } catch (err) {
+        console.error('Error:', err.message || err);
+        return res.status(500).json({ success: false, message: err.message || 'Internal server error' });
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`C2C GitHub backup service running on port ${PORT}`);
