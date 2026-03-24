@@ -446,7 +446,7 @@ app.get('/get-branch-code', async (req, res) => {
         }
 
         // Fetch all file contents in parallel
-        const files = await Promise.all(
+        const fileContents = await Promise.all(
             blobs.map(async (file) => {
                 const { data: blob } = await octokit.git.getBlob({
                     owner: OWNER, repo: REPO, file_sha: file.sha,
@@ -458,6 +458,24 @@ app.get('/get-branch-code', async (req, res) => {
             })
         );
 
+        // Rebuild same nested structure as /get-template
+        const result = {};
+        for (const { path, content } of fileContents) {
+            const parts = path.split('/');
+            if (parts.length === 2) {
+                const prefix = parts[0];
+                const key = parts[1].replace(/\.(css|js|html)$/, '');
+                result[`${prefix}_${key}`] = content;
+            } else if (parts.length === 3) {
+                const prefix = parts[0];
+                const subFolder = parts[1];
+                const key = parts[2].replace(/\.(css|js|html)$/, '');
+                const fullKey = `${prefix}_${subFolder}`;
+                if (!result[fullKey]) result[fullKey] = {};
+                result[fullKey][key] = content;
+            }
+        }
+
         return res.status(200).json({
             success: true,
             branch,
@@ -465,8 +483,7 @@ app.get('/get-branch-code', async (req, res) => {
             commit_sha_full: targetSha,
             committed_at: commitData.author.date,
             commit_message: commitData.message,
-            total_files: files.length,
-            files,
+            data: result,
         });
 
     } catch (err) {
