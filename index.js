@@ -396,6 +396,85 @@ app.get('/get-commits', async (req, res) => {
     }
 });
 
+// GET API - get latest commit files/code for a given branch name
+app.get('/get-branch-code', async (req, res) => {
+    try {
+        const { branch, commit_sha } = req.query;
+
+        if (!branch) {
+            return res.status(400).json({ success: false, message: 'branch is required' });
+        }
+
+        // Verify branch exists
+        const latestSha = await getBranchSha(branch);
+        if (!latestSha) {
+            return res.status(404).json({ success: false, message: `Branch not found: ${branch}` });
+        }
+
+        // Use provided commit SHA if given, otherwise fall back to latest
+        let targetSha = latestSha;
+        if (commit_sha) {
+            if (commit_sha.length === 40) {
+                targetSha = commit_sha;
+            } else {
+                // Short SHA — resolve to full SHA
+                const { data: commits } = await octokit.repos.listCommits({
+                    owner: OWNER, repo: REPO, sha: branch, per_page: 100,
+                });
+                const matched = commits.find(c => c.sha.startsWith(commit_sha));
+                if (!matched) {
+                    return res.status(404).json({ success: false, message: `Commit not found: ${commit_sha}` });
+                }
+                targetSha = matched.sha;
+            }
+        }
+
+        // Get full commit info
+        const { data: commitData } = await octokit.git.getCommit({
+            owner: OWNER, repo: REPO, commit_sha: targetSha,
+        });
+
+        // Get full recursive file tree at latest commit
+        const { data: treeData } = await octokit.git.getTree({
+            owner: OWNER, repo: REPO, tree_sha: commitData.tree.sha, recursive: 'true',
+        });
+
+        const blobs = treeData.tree.filter(item => item.type === 'blob');
+
+        if (blobs.length === 0) {
+            return res.status(404).json({ success: false, message: 'No files found in this branch' });
+        }
+
+        // Fetch all file contents in parallel
+        const files = await Promise.all(
+            blobs.map(async (file) => {
+                const { data: blob } = await octokit.git.getBlob({
+                    owner: OWNER, repo: REPO, file_sha: file.sha,
+                });
+                return {
+                    path: file.path,
+                    content: Buffer.from(blob.content, 'base64').toString('utf-8'),
+                };
+            })
+        );
+
+        return res.status(200).json({
+            success: true,
+            branch,
+            commit_sha: targetSha.substring(0, 7),
+            commit_sha_full: targetSha,
+            committed_at: commitData.author.date,
+            commit_message: commitData.message,
+            total_files: files.length,
+            files,
+        });
+
+    } catch (err) {
+        console.error('Error:', err.message || err);
+        return res.status(500).json({ success: false, message: err.message || 'Internal server error' });
+    }
+});
+
 // GET API - autocomplete branch names, ordered by newest commit, optional title filter
 app.get('/branches', async (req, res) => {
     try {
