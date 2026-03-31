@@ -1,17 +1,20 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { Octokit } = require('@octokit/rest');
+const axios = require('axios');
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
-
-const OWNER = process.env.GITHUB_OWNER;
-const REPO = process.env.GITHUB_REPO;
+const GITLAB_URL = (process.env.GITLAB_URL || 'https://gitlab.com').replace(/\/$/, '');
+const PROJECT_ID = encodeURIComponent(process.env.GITLAB_PROJECT_ID);
 const BASE_BRANCH = process.env.BASE_BRANCH || 'main';
+
+const api = axios.create({
+    baseURL: `${GITLAB_URL}/api/v4`,
+    headers: { 'PRIVATE-TOKEN': process.env.GITLAB_TOKEN },
+});
 
 function getTimestamp() {
     const now = new Date();
@@ -77,26 +80,28 @@ function buildFileList(payload) {
 
 async function getBranchSha(branchName) {
     try {
-        const { data } = await octokit.repos.getBranch({ owner: OWNER, repo: REPO, branch: branchName });
-        return data.commit.sha;
+        const { data } = await api.get(`/projects/${PROJECT_ID}/repository/branches/${encodeURIComponent(branchName)}`);
+        return data.commit.id;
     } catch (err) {
-        if (err.status === 404) return null;
+        if (err.response && err.response.status === 404) return null;
         throw err;
     }
 }
 
 async function initializeRepoIfEmpty() {
     try {
-        await octokit.repos.getBranch({ owner: OWNER, repo: REPO, branch: BASE_BRANCH });
+        await api.get(`/projects/${PROJECT_ID}/repository/branches/${encodeURIComponent(BASE_BRANCH)}`);
     } catch (err) {
-        if (err.status === 404) {
-            await octokit.repos.createOrUpdateFileContents({
-                owner: OWNER,
-                repo: REPO,
-                path: 'README.md',
-                message: 'Initial commit',
-                content: Buffer.from('# C2C Template Backup\nThis repo stores C2C templates per company.', 'utf-8').toString('base64'),
+        if (err.response && err.response.status === 404) {
+            await api.post(`/projects/${PROJECT_ID}/repository/commits`, {
                 branch: BASE_BRANCH,
+                commit_message: 'Initial commit',
+                actions: [{
+                    action: 'create',
+                    file_path: 'README.md',
+                    content: Buffer.from('# C2C Template Backup\nThis repo stores C2C templates per company.', 'utf-8').toString('base64'),
+                    encoding: 'base64',
+                }],
             });
             console.log('Initialized empty repo with README on main');
         } else {
@@ -106,47 +111,73 @@ async function initializeRepoIfEmpty() {
 }
 
 async function getBaseBranchSha() {
-    const { data } = await octokit.repos.getBranch({ owner: OWNER, repo: REPO, branch: BASE_BRANCH });
-    return data.commit.sha;
+    const { data } = await api.get(`/projects/${PROJECT_ID}/repository/branches/${encodeURIComponent(BASE_BRANCH)}`);
+    return data.commit.id;
 }
 
 async function createBranch(branchName, sha) {
-    await octokit.git.createRef({ owner: OWNER, repo: REPO, ref: `refs/heads/${branchName}`, sha });
+    await api.post(`/projects/${PROJECT_ID}/repository/branches`, {
+        branch: branchName,
+        ref: sha,
+    });
 }
 
-// Single commit for all files using Git Tree API
+// Get all blob file paths currently in a branch (to decide create vs update per file)
+async function getExistingFilePaths(branchName) {
+    const paths = new Set();
+    let page = 1;
+    while (true) {
+        const { data } = await api.get(`/projects/${PROJECT_ID}/repository/tree`, {
+            params: { ref: branchName, recursive: true, per_page: 100, page },
+        });
+        for (const item of data) {
+            if (item.type === 'blob') paths.add(item.path);
+        }
+        if (data.length < 100) break;
+        page++;
+    }
+    return paths;
+}
+
+// Single commit for all files using GitLab Commits API
 async function commitAllFiles(branchName, files, commitMessage) {
-    const { data: refData } = await octokit.git.getRef({ owner: OWNER, repo: REPO, ref: `heads/${branchName}` });
-    const latestCommitSha = refData.object.sha;
+    const existingPaths = await getExistingFilePaths(branchName);
 
-    const { data: commitData } = await octokit.git.getCommit({ owner: OWNER, repo: REPO, commit_sha: latestCommitSha });
-    const baseTreeSha = commitData.tree.sha;
+    const actions = files.map(({ path, content }) => ({
+        action: existingPaths.has(path) ? 'update' : 'create',
+        file_path: path,
+        content: Buffer.from(content, 'utf-8').toString('base64'),
+        encoding: 'base64',
+    }));
 
-    const treeItems = await Promise.all(
-        files.map(async ({ path, content }) => {
-            const { data: blob } = await octokit.git.createBlob({
-                owner: OWNER,
-                repo: REPO,
-                content: Buffer.from(content, 'utf-8').toString('base64'),
-                encoding: 'base64',
-            });
-            return { path, mode: '100644', type: 'blob', sha: blob.sha };
-        })
-    );
-
-    const { data: newTree } = await octokit.git.createTree({ owner: OWNER, repo: REPO, base_tree: baseTreeSha, tree: treeItems });
-
-    const { data: newCommit } = await octokit.git.createCommit({
-        owner: OWNER,
-        repo: REPO,
-        message: commitMessage,
-        tree: newTree.sha,
-        parents: [latestCommitSha],
+    const { data } = await api.post(`/projects/${PROJECT_ID}/repository/commits`, {
+        branch: branchName,
+        commit_message: commitMessage,
+        actions,
     });
 
-    await octokit.git.updateRef({ owner: OWNER, repo: REPO, ref: `heads/${branchName}`, sha: newCommit.sha });
+    return data.id; // commit SHA
+}
 
-    return newCommit.sha;
+// Get full recursive file tree for a given commit SHA (handles pagination)
+async function getFullTree(commitSha) {
+    const items = [];
+    let page = 1;
+    while (true) {
+        const { data } = await api.get(`/projects/${PROJECT_ID}/repository/tree`, {
+            params: { ref: commitSha, recursive: true, per_page: 100, page },
+        });
+        items.push(...data);
+        if (data.length < 100) break;
+        page++;
+    }
+    return items;
+}
+
+// Get blob content by blob SHA (base64-decoded)
+async function getBlobContent(blobSha) {
+    const { data } = await api.get(`/projects/${PROJECT_ID}/repository/blobs/${blobSha}`);
+    return Buffer.from(data.content, 'base64').toString('utf-8');
 }
 
 // POST API - create a new branch from company base branch
@@ -185,7 +216,7 @@ app.post('/create-branch', async (req, res) => {
 
     } catch (err) {
         console.error('Error:', err.message || err);
-        return res.status(500).json({ success: false, message: err.message || 'Internal server error' });
+        return res.status(500).json({ success: false, message: err.response?.data?.message || err.message || 'Internal server error' });
     }
 });
 
@@ -246,7 +277,7 @@ app.post('/store-template', async (req, res) => {
 
     } catch (err) {
         console.error('Error:', err.message || err);
-        return res.status(500).json({ success: false, message: err.message || 'Internal server error' });
+        return res.status(500).json({ success: false, message: err.response?.data?.message || err.message || 'Internal server error' });
     }
 });
 
@@ -275,29 +306,25 @@ app.get('/get-template', async (req, res) => {
                 targetCommitSha = commit;
             } else {
                 // Short SHA — find full SHA by listing commits
-                const { data: commits } = await octokit.repos.listCommits({
-                    owner: OWNER, repo: REPO, sha: branchName, per_page: 100,
+                const { data: commits } = await api.get(`/projects/${PROJECT_ID}/repository/commits`, {
+                    params: { ref_name: branchName, per_page: 100 },
                 });
-                const matched = commits.find(c => c.sha.startsWith(commit));
+                const matched = commits.find(c => c.id.startsWith(commit));
                 if (!matched) {
                     return res.status(404).json({ success: false, message: `Commit not found: ${commit}` });
                 }
-                targetCommitSha = matched.sha;
+                targetCommitSha = matched.id;
             }
         }
 
         // Get commit info (for timestamp)
-        const { data: commitData } = await octokit.git.getCommit({
-            owner: OWNER, repo: REPO, commit_sha: targetCommitSha,
-        });
+        const { data: commitData } = await api.get(`/projects/${PROJECT_ID}/repository/commits/${targetCommitSha}`);
 
         // Get full tree at that commit (recursive to include subfolders)
-        const { data: treeData } = await octokit.git.getTree({
-            owner: OWNER, repo: REPO, tree_sha: commitData.tree.sha, recursive: 'true',
-        });
+        const treeItems = await getFullTree(targetCommitSha);
 
         // Filter only blob files (exclude README etc at root)
-        const companyFiles = treeData.tree.filter(
+        const companyFiles = treeItems.filter(
             item => item.type === 'blob' && (item.path.startsWith('published/') || item.path.startsWith('unpublished/'))
         );
 
@@ -308,10 +335,7 @@ app.get('/get-template', async (req, res) => {
         // Fetch content of all files in parallel
         const fileContents = await Promise.all(
             companyFiles.map(async (file) => {
-                const { data: blob } = await octokit.git.getBlob({
-                    owner: OWNER, repo: REPO, file_sha: file.sha,
-                });
-                const content = Buffer.from(blob.content, 'base64').toString('utf-8');
+                const content = await getBlobContent(file.id);
                 return { path: file.path, content };
             })
         );
@@ -344,14 +368,14 @@ app.get('/get-template', async (req, res) => {
             company_id,
             branch: branchName,
             commit_sha: targetCommitSha,
-            committed_at: commitData.author.date,
+            committed_at: commitData.authored_date,
             commit_message: commitData.message,
             data: result,
         });
 
     } catch (err) {
         console.error('Error:', err.message || err);
-        return res.status(500).json({ success: false, message: err.message || 'Internal server error' });
+        return res.status(500).json({ success: false, message: err.response?.data?.message || err.message || 'Internal server error' });
     }
 });
 
@@ -371,15 +395,15 @@ app.get('/get-commits', async (req, res) => {
             return res.status(404).json({ success: false, message: `No data found for company_id: ${company_id}` });
         }
 
-        const { data: commits } = await octokit.repos.listCommits({
-            owner: OWNER, repo: REPO, sha: branchName, per_page: 50,
+        const { data: commits } = await api.get(`/projects/${PROJECT_ID}/repository/commits`, {
+            params: { ref_name: branchName, per_page: 50 },
         });
 
         const commitList = commits.map(c => ({
-            commit_sha: c.sha.substring(0, 7),
-            commit_sha_full: c.sha,
-            message: c.commit.message,
-            committed_at: c.commit.author.date,
+            commit_sha: c.id.substring(0, 7),
+            commit_sha_full: c.id,
+            message: c.message,
+            committed_at: c.authored_date,
         }));
 
         return res.status(200).json({
@@ -392,7 +416,7 @@ app.get('/get-commits', async (req, res) => {
 
     } catch (err) {
         console.error('Error:', err.message || err);
-        return res.status(500).json({ success: false, message: err.message || 'Internal server error' });
+        return res.status(500).json({ success: false, message: err.response?.data?.message || err.message || 'Internal server error' });
     }
 });
 
@@ -418,28 +442,23 @@ app.get('/get-branch-code', async (req, res) => {
                 targetSha = commit_sha;
             } else {
                 // Short SHA — resolve to full SHA
-                const { data: commits } = await octokit.repos.listCommits({
-                    owner: OWNER, repo: REPO, sha: branch, per_page: 100,
+                const { data: commits } = await api.get(`/projects/${PROJECT_ID}/repository/commits`, {
+                    params: { ref_name: branch, per_page: 100 },
                 });
-                const matched = commits.find(c => c.sha.startsWith(commit_sha));
+                const matched = commits.find(c => c.id.startsWith(commit_sha));
                 if (!matched) {
                     return res.status(404).json({ success: false, message: `Commit not found: ${commit_sha}` });
                 }
-                targetSha = matched.sha;
+                targetSha = matched.id;
             }
         }
 
         // Get full commit info
-        const { data: commitData } = await octokit.git.getCommit({
-            owner: OWNER, repo: REPO, commit_sha: targetSha,
-        });
+        const { data: commitData } = await api.get(`/projects/${PROJECT_ID}/repository/commits/${targetSha}`);
 
-        // Get full recursive file tree at latest commit
-        const { data: treeData } = await octokit.git.getTree({
-            owner: OWNER, repo: REPO, tree_sha: commitData.tree.sha, recursive: 'true',
-        });
-
-        const blobs = treeData.tree.filter(item => item.type === 'blob');
+        // Get full recursive file tree at that commit
+        const treeItems = await getFullTree(targetSha);
+        const blobs = treeItems.filter(item => item.type === 'blob');
 
         if (blobs.length === 0) {
             return res.status(404).json({ success: false, message: 'No files found in this branch' });
@@ -448,13 +467,8 @@ app.get('/get-branch-code', async (req, res) => {
         // Fetch all file contents in parallel
         const fileContents = await Promise.all(
             blobs.map(async (file) => {
-                const { data: blob } = await octokit.git.getBlob({
-                    owner: OWNER, repo: REPO, file_sha: file.sha,
-                });
-                return {
-                    path: file.path,
-                    content: Buffer.from(blob.content, 'base64').toString('utf-8'),
-                };
+                const content = await getBlobContent(file.id);
+                return { path: file.path, content };
             })
         );
 
@@ -481,14 +495,14 @@ app.get('/get-branch-code', async (req, res) => {
             branch,
             commit_sha: targetSha.substring(0, 7),
             commit_sha_full: targetSha,
-            committed_at: commitData.author.date,
+            committed_at: commitData.authored_date,
             commit_message: commitData.message,
             data: result,
         });
 
     } catch (err) {
         console.error('Error:', err.message || err);
-        return res.status(500).json({ success: false, message: err.message || 'Internal server error' });
+        return res.status(500).json({ success: false, message: err.response?.data?.message || err.message || 'Internal server error' });
     }
 });
 
@@ -496,51 +510,27 @@ app.get('/get-branch-code', async (req, res) => {
 app.get('/branches', async (req, res) => {
     try {
         const { title } = req.query;
-        const search = title ? title.trim().toLowerCase() : '';
+        const search = title ? title.trim() : '';
 
-        // Fetch up to 300 branches across 3 pages to build a solid search pool
+        // Fetch up to 300 branches across 3 pages
+        // GitLab branch listing already includes commit date — no extra API calls needed
         let allBranches = [];
         for (let page = 1; page <= 3; page++) {
-            const { data } = await octokit.repos.listBranches({
-                owner: OWNER, repo: REPO, per_page: 100, page,
+            const { data } = await api.get(`/projects/${PROJECT_ID}/repository/branches`, {
+                params: { per_page: 100, page, ...(search && { search }) },
             });
             allBranches = allBranches.concat(data);
             if (data.length < 100) break;
         }
 
-        // Filter by search term — case-insensitive substring match on branch name
-        const filtered = search
-            ? allBranches.filter(b => b.name.toLowerCase().includes(search))
-            : allBranches;
+        const withDates = allBranches.slice(0, 60).map(branch => ({
+            name: branch.name,
+            commit_sha: branch.commit.id.substring(0, 7),
+            commit_sha_full: branch.commit.id,
+            committed_at: branch.commit.committed_date,
+        }));
 
-        // Fetch commit dates in parallel for up to 60 candidates, then sort + trim to 30
-        // (60 gives enough buffer so after date-sorting we still return the true 30 newest)
-        const candidates = filtered.slice(0, 60);
-
-        const withDates = await Promise.all(
-            candidates.map(async (branch) => {
-                try {
-                    const { data: commit } = await octokit.git.getCommit({
-                        owner: OWNER, repo: REPO, commit_sha: branch.commit.sha,
-                    });
-                    return {
-                        name: branch.name,
-                        commit_sha: branch.commit.sha.substring(0, 7),
-                        commit_sha_full: branch.commit.sha,
-                        committed_at: commit.author.date,
-                    };
-                } catch {
-                    return {
-                        name: branch.name,
-                        commit_sha: branch.commit.sha.substring(0, 7),
-                        commit_sha_full: branch.commit.sha,
-                        committed_at: null,
-                    };
-                }
-            })
-        );
-
-        // Sort newest first — branches with no date fall to the bottom
+        // Sort newest first
         withDates.sort((a, b) => {
             if (!a.committed_at && !b.committed_at) return 0;
             if (!a.committed_at) return 1;
@@ -550,17 +540,17 @@ app.get('/branches', async (req, res) => {
 
         return res.status(200).json({
             success: true,
-            total: filtered.length,
+            total: allBranches.length,
             branches: withDates.slice(0, 30),
         });
 
     } catch (err) {
         console.error('Error:', err.message || err);
-        return res.status(500).json({ success: false, message: err.message || 'Internal server error' });
+        return res.status(500).json({ success: false, message: err.response?.data?.message || err.message || 'Internal server error' });
     }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`C2C GitHub backup service running on port ${PORT}`);
+    console.log(`C2C GitLab backup service running on port ${PORT}`);
 });
