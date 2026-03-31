@@ -16,6 +16,13 @@ const api = axios.create({
     headers: { 'PRIVATE-TOKEN': process.env.GITLAB_TOKEN },
 });
 
+function gitlabError(err) {
+    const d = err.response?.data;
+    const msg = d?.message || d?.error_description || d?.error || (typeof d === 'string' ? d : null);
+    if (msg) console.error('GitLab error detail:', msg);
+    return msg || err.message || 'Internal server error';
+}
+
 function getTimestamp() {
     const now = new Date();
     return now.toISOString().replace('T', ' ').substring(0, 19);
@@ -216,7 +223,7 @@ app.post('/create-branch', async (req, res) => {
 
     } catch (err) {
         console.error('Error:', err.message || err);
-        return res.status(500).json({ success: false, message: err.response?.data?.message || err.message || 'Internal server error' });
+        return res.status(500).json({ success: false, message: gitlabError(err) });
     }
 });
 
@@ -277,7 +284,7 @@ app.post('/store-template', async (req, res) => {
 
     } catch (err) {
         console.error('Error:', err.message || err);
-        return res.status(500).json({ success: false, message: err.response?.data?.message || err.message || 'Internal server error' });
+        return res.status(500).json({ success: false, message: gitlabError(err) });
     }
 });
 
@@ -375,7 +382,7 @@ app.get('/get-template', async (req, res) => {
 
     } catch (err) {
         console.error('Error:', err.message || err);
-        return res.status(500).json({ success: false, message: err.response?.data?.message || err.message || 'Internal server error' });
+        return res.status(500).json({ success: false, message: gitlabError(err) });
     }
 });
 
@@ -416,7 +423,7 @@ app.get('/get-commits', async (req, res) => {
 
     } catch (err) {
         console.error('Error:', err.message || err);
-        return res.status(500).json({ success: false, message: err.response?.data?.message || err.message || 'Internal server error' });
+        return res.status(500).json({ success: false, message: gitlabError(err) });
     }
 });
 
@@ -502,7 +509,7 @@ app.get('/get-branch-code', async (req, res) => {
 
     } catch (err) {
         console.error('Error:', err.message || err);
-        return res.status(500).json({ success: false, message: err.response?.data?.message || err.message || 'Internal server error' });
+        return res.status(500).json({ success: false, message: gitlabError(err) });
     }
 });
 
@@ -546,7 +553,7 @@ app.get('/branches', async (req, res) => {
 
     } catch (err) {
         console.error('Error:', err.message || err);
-        return res.status(500).json({ success: false, message: err.response?.data?.message || err.message || 'Internal server error' });
+        return res.status(500).json({ success: false, message: gitlabError(err) });
     }
 });
 
